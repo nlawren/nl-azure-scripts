@@ -1,0 +1,20 @@
+# patch-status.toml: copy this file to patch-status.toml and fill in your subscriptions.
+# Subscription IDs aren't secrets, so this file can be committed. Command-line flags override
+# everything here.
+
+# Defaults for every subscription. Leave any of these out to use the built-in default.
+schedule = "mc-linux-weekly"  # maintenance configuration every VM should be on (omit: any weekly)
+format = "xlsx"               # or "csv"
+stale_days = 2                # flag running VMs whose last assessment is older than this
+max_run_age = 8               # flag VMs whose last patch run is older than this
+eol_warn_days = 180           # flag OS releases reaching end of life within this many days
+
+[[subscriptions]]
+name = "Production"           # optional label for the report (default: the subscription's name)
+id = "00000000-0000-0000-0000-000000000000"
+# resource_groups = ["rg-app-prod", "rg-data-prod"]  # omit to scan the whole subscription
+# schedule = "mc-linux-weekly-prod"                   # overrides the top-level schedule
+
+[[subscriptions]]
+name = "Non-production"
+id = "11111111-1111-1111-1111-111111111111"

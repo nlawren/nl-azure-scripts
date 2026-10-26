@@ -1,0 +1,28 @@
+[project]
+name = "patch-status"
+version = "0.1.0"
+description = "Report Azure Update Manager patch status for Linux VMs in a resource group"
+requires-python = ">=3.14"
+dependencies = [
+    "azure-identity",
+    "azure-mgmt-resourcegraph",
+    "xlsxwriter",
+]
+
+[tool.uv]
+required-version = ">=0.11"
+package = false
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # conflicts with the formatter
+    "CPY001", # no copyright header in internal scripts
+    "D203",   # incompatible with D211
+    "D213",   # incompatible with D212
+    "T201",   # print is the CLI's output
+]

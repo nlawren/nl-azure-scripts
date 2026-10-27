@@ -21,7 +21,7 @@ Each VM gets a `status` of **OK** or **Attention**, and an `issues` column that 
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/). It installs Python 3.14 and the dependencies (`azure-identity`, `azure-mgmt-resourcegraph`, `xlsxwriter`) itself.
+- [uv](https://docs.astral.sh/uv/). It installs Python 3.14 and the dependencies (`azure-identity`, `azure-mgmt-resourcegraph`, `rich`, `rich-argparse`, `xlsxwriter`) itself.
 - An Azure identity with **Reader** on each subscription or resource group being scanned. To show schedule details, it also needs Reader wherever the maintenance configurations live, if that's a different subscription.
 - Outbound HTTPS to `endoflife.date` for the OS support check. This is optional: see `--no-eol-check`.
 
@@ -40,7 +40,7 @@ az login
 uv run patch_status.py
 ```
 
-That writes `patch-status-YYYYMMDD.xlsx` in the current directory and prints the VMs that need attention.
+That writes `patch-status-YYYYMMDD.xlsx` in the current directory and prints a summary of the VMs that need attention.
 
 ## Configuration
 
@@ -145,7 +145,7 @@ uv run patch_status.py --schedule mc-linux-weekly --fail-on-issues
 - **Patch status** sheet: one filterable table with a frozen header row and name column, and a red or green highlight on `status`.
 - **About** sheet: when the report ran, the thresholds used, and a table for each subscription showing its scope, expected schedule, VM count and how many need attention.
 
-**CSV** has the same columns as the main sheet.
+**CSV** has the same columns as the main sheet. It's written as UTF-8 with a byte order mark, so Excel opens it without garbling non-ASCII text.
 
 Times are shown in `Australia/Sydney`. To change that, edit `LOCAL_TZ` in the script.
 
@@ -162,6 +162,30 @@ Times are shown in `Australia/Sydney`. To change that, edit `LOCAL_TZ` in the sc
 | `securityPending`, `criticalPending`, `otherPending`, `rebootPending` | What the latest assessment found waiting |
 | `lastPatchRun`, `patchRunStatus`, `patchesInstalled`, `patchesFailed`, `patchRunStartedBy` | Latest patch run |
 | `location`, `resourceId` | Azure region and full resource ID |
+
+## Console output
+
+Everything the script prints goes to stderr, as timestamped lines:
+
+```
+16:20:06 Started: scanning 2 subscriptions (from patch-status.toml)
+16:20:06 Authenticated as someone@example.com (tenant ...)
+16:20:06 Found 4 maintenance configurations the identity can read
+16:20:07 Production (all resource groups): 42 Linux VMs, 3 need attention
+16:20:08 Non-production (all resource groups): 30 Linux VMs, 29 need attention
+16:20:08 Wrote 72 Linux VMs to patch-status-20261027.xlsx
+```
+
+While it runs in a terminal, a progress bar shows which subscription and stage it's on. At the end it prints these tables:
+
+- **Summary**: total VMs, how many are OK or need attention, and how long the run took.
+- **By subscription**: the same counts for each subscription, when more than one is scanned.
+- **Most common issues**: each kind of issue and how many VMs have it.
+- **Need attention**: the flagged VMs, those with the most issues first. Only the first 25 are listed. The report has them all.
+
+Errors such as a failed sign-in, or a subscription the identity can't read, are a single red line rather than a traceback.
+
+When stderr isn't a terminal (for example a pipeline log or `2> run.log`), colour and the progress bar are switched off, and tables are drawn 160 characters wide so they don't wrap.
 
 ## Running in Azure DevOps
 

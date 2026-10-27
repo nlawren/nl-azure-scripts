@@ -751,7 +751,11 @@ def load_env_file(path: Path) -> None:
 def load_config(path: Path) -> dict[str, Any]:
     """Read the TOML config, rejecting unknown keys so typos don't pass silently."""
     with path.open("rb") as fh:
-        config = tomllib.load(fh)
+        try:
+            config = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            msg = f"{path}: {exc}"
+            raise ValueError(msg) from exc
     unknown = set(config) - set(DEFAULTS) - {"subscriptions"}
     if unknown:
         msg = f"{path}: unknown setting(s): {', '.join(sorted(unknown))}"
@@ -947,7 +951,7 @@ def load_sources(
     if config_path.is_file():
         try:
             config = load_config(config_path)
-        except (tomllib.TOMLDecodeError, ValueError, TypeError) as exc:
+        except (ValueError, TypeError) as exc:
             parser.error(str(exc))
     elif explicit:
         parser.error(f"config file not found: {config_path}")

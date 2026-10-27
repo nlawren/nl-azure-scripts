@@ -55,7 +55,12 @@ from zoneinfo import ZoneInfo
 import xlsxwriter
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
-from azure.mgmt.resourcegraph.models import QueryRequest, QueryRequestOptions, ResultFormat
+from azure.mgmt.resourcegraph.models import (
+    QueryRequest,
+    QueryRequestOptions,
+    ResultFormat,
+    ResultTruncated,
+)
 
 LOCAL_TZ = ZoneInfo("Australia/Sydney")
 PAGE_SIZE = 1000  # Resource Graph maximum rows per page
@@ -72,8 +77,10 @@ DEFAULTS: dict[str, Any] = {
 }
 SUBSCRIPTION_KEYS = {"id", "name", "resource_groups", "schedule"}
 REQUIRED_MODE = "AutomaticByPlatform"
+PATCH_SCOPE = "InGuestPatch"
 MAX_COL_WIDTH = 60
 EXIT_ISSUES = 1
+EXIT_CONFIG = 2  # same as argparse errors
 
 EOL_API = "https://endoflife.date/api/v1/products/{product}"
 EOL_TIMEOUT = 15
@@ -124,6 +131,8 @@ DATE_COLUMNS = {"lastAssessment", "lastPatchRun"}
 # --- Resource Graph queries --------------------------------------------------------------
 # {rg_filter} is empty (whole subscription) or a resource group filter built by rg_filter()
 # from names validated against RG_NAME_RE.
+# Every query projects the resource's own `id`: without it Resource Graph returns no skip
+# token, so results stop at the first page.
 
 VM_QUERY = """
 resources
@@ -132,6 +141,7 @@ resources
 | where properties.storageProfile.osDisk.osType =~ 'Linux'
 | extend ps = properties.osProfile.linuxConfiguration.patchSettings
 | project
+    id,
     vmId = tolower(id),
     name,
     subscriptionId,
@@ -153,6 +163,7 @@ patchassessmentresources
 {rg_filter}
 | extend vmId = tolower(substring(id, 0, indexof(tolower(id), '/patchassessmentresults')))
 | project
+    id,
     vmId,
     assessmentStatus = tostring(properties.status),
     lastAssessment = tostring(properties.lastModifiedDateTime),
@@ -168,8 +179,9 @@ patchinstallationresources
 {rg_filter}
 | extend vmId = tolower(substring(id, 0, indexof(tolower(id), '/patchinstallationresults')))
 | extend runTime = todatetime(properties.lastModifiedDateTime)
-| summarize arg_max(runTime, properties) by vmId
+| summarize arg_max(runTime, id, properties) by vmId
 | project
+    id,
     vmId,
     lastPatchRun = tostring(runTime),
     patchRunStatus = tostring(properties.status),
@@ -187,7 +199,7 @@ maintenanceresources
 | where vmId has '/providers/microsoft.compute/virtualmachines/'
 | extend resourceGroup = tostring(split(vmId, '/')[4])
 {rg_filter}
-| project vmId, configId = tolower(tostring(properties.maintenanceConfigurationId))
+| project id, vmId, configId = tolower(tostring(properties.maintenanceConfigurationId))
 """
 
 # Run without a subscription list, so configs held in a central subscription are found too.
@@ -195,6 +207,7 @@ CONFIG_QUERY = """
 resources
 | where type =~ 'microsoft.maintenance/maintenanceconfigurations'
 | project
+    id,
     configId = tolower(id),
     configName = name,
     scope = tostring(properties.maintenanceScope),
@@ -204,10 +217,18 @@ resources
     timeZone = tostring(properties.maintenanceWindow.timeZone)
 """
 
-SUBSCRIPTION_QUERY = """
+# Subscriptions and resource groups the identity can read. Reader on just a resource group
+# shows that group but not its subscription.
+CONTAINER_QUERY = """
 resourcecontainers
-| where type =~ 'microsoft.resources/subscriptions'
-| project subscriptionId = tolower(subscriptionId), name
+| where type in~ ('microsoft.resources/subscriptions',
+    'microsoft.resources/subscriptions/resourcegroups')
+| project
+    id,
+    isSubscription = type =~ 'microsoft.resources/subscriptions',
+    subscriptionId = tolower(subscriptionId),
+    resourceGroup = tolower(resourceGroup),
+    name
 """
 
 
@@ -268,6 +289,9 @@ def run_query(
         rows.extend(cast("list[dict[str, Any]]", response.data))
         skip_token = response.skip_token
         if not skip_token:
+            if response.result_truncated == ResultTruncated.TRUE:
+                msg = f"Resource Graph truncated results at {len(rows)} rows with no skip token"
+                raise RuntimeError(msg)
             return rows
 
 
@@ -382,14 +406,22 @@ def config_issues(row: dict[str, Any]) -> list[str]:
 
 
 def schedule_issues(configs: list[dict[str, Any]], expected: str | None) -> list[str]:
-    """Check the VM is assigned to a weekly maintenance configuration (and the right one)."""
+    """Check the VM is assigned to a weekly patch maintenance configuration (and the right one).
+
+    Only InGuestPatch configs patch the guest OS; Host or OSImage configs don't count. A config
+    the identity can't read has no scope, so it's given the benefit of the doubt.
+    """
     if not configs:
         return ["no maintenance schedule assigned"]
+    candidates = [c for c in configs if c.get("scope", PATCH_SCOPE).lower() == PATCH_SCOPE.lower()]
+    if not candidates:
+        scopes = ", ".join(sorted({c["scope"] or "unknown" for c in configs}))
+        return [f"no patch schedule assigned (only {scopes} maintenance)"]
     issues: list[str] = []
-    names = {c["configName"].lower() for c in configs}
+    names = {c["configName"].lower() for c in candidates}
     if expected and expected.lower() not in names:
         issues.append(f"not on schedule {expected}")
-    visible = [c for c in configs if "recurEvery" in c]
+    visible = [c for c in candidates if "recurEvery" in c]
     if not visible:
         issues.append("schedule details not visible (needs Reader where the config lives)")
     elif not any("week" in (c.get("recurEvery") or "").lower() for c in visible):
@@ -455,9 +487,9 @@ def collect(settings: Settings) -> list[dict[str, Any]]:
     """Query Resource Graph and build one merged report row per Linux VM, for every target."""
     client = ResourceGraphClient(DefaultAzureCredential())
     sub_ids = [t.id for t in settings.targets]
-    sub_names = {
-        r["subscriptionId"]: r["name"] for r in run_query(client, sub_ids, SUBSCRIPTION_QUERY)
-    }
+    containers = run_query(client, sub_ids, CONTAINER_QUERY)
+    sub_names = {r["subscriptionId"]: r["name"] for r in containers if r["isSubscription"]}
+    check_readable(settings.targets, sub_names, containers)
     configs = {r["configId"]: r for r in run_query(client, None, CONFIG_QUERY)}
     eol = EolLookup(settings.eol_warn_days) if settings.eol_check else None
     now = datetime.now(UTC)
@@ -475,6 +507,30 @@ def collect(settings: Settings) -> list[dict[str, Any]]:
         rows.extend(found)
     rows.sort(key=lambda r: (r["subscription"].lower(), r["resourceGroup"], r["name"].lower()))
     return rows
+
+
+def check_readable(
+    targets: tuple[Target, ...], sub_names: dict[str, str], containers: list[dict[str, Any]]
+) -> None:
+    """Fail if a target can't be read, rather than reporting it as having no Linux VMs.
+
+    Resource Graph silently returns nothing for scopes the identity can't read. A target with
+    resource groups needs each group to be visible; a whole-subscription target needs Reader on
+    the subscription itself, or the scan would only cover the groups that happen to be readable.
+    """
+    groups = {(r["subscriptionId"], r["resourceGroup"]) for r in containers}
+    missing: list[str] = []
+    for t in targets:
+        if t.resource_groups:
+            missing += [
+                f"{t.id}/{rg}" for rg in t.resource_groups if (t.id, rg.lower()) not in groups
+            ]
+        elif t.id not in sub_names:
+            hint = " (Reader on only some resource groups? list them with -g)"
+            missing.append(t.id + (hint if any(s == t.id for s, _ in groups) else ""))
+    if missing:
+        msg = f"not found or not readable: {', '.join(missing)}"
+        raise LookupError(msg)
 
 
 def collect_target(  # noqa: PLR0913 - plumbing for one subscription
@@ -705,9 +761,13 @@ def load_config(path: Path) -> dict[str, Any]:
         if bad:
             msg = f"{path}: subscription {i}: unknown key(s): {', '.join(sorted(bad))}"
             raise ValueError(msg)
-        if "id" not in sub:
-            msg = f"{path}: subscription {i} has no id"
-            raise ValueError(msg)
+        if not isinstance(sub.get("id"), str):
+            msg = f"{path}: subscription {i} needs an id string"
+            raise TypeError(msg)
+        groups = sub.get("resource_groups", [])
+        if not isinstance(groups, list) or not all(isinstance(g, str) for g in groups):
+            msg = f'{path}: subscription {i}: resource_groups must be a list, e.g. ["rg-app"]'
+            raise TypeError(msg)
     return config
 
 
@@ -766,7 +826,8 @@ examples:
 exit codes:
   0  report written (VMs may still need attention unless --fail-on-issues is set)
   1  no Linux VMs found, or --fail-on-issues and at least one VM needs attention
-  2  bad arguments or config file
+  2  bad arguments or config file, or a subscription or resource group
+     that doesn't exist or can't be read
 
 Authentication uses DefaultAzureCredential (az login, a pipeline service connection, or
 AZURE_CLIENT_ID/AZURE_CLIENT_SECRET/AZURE_TENANT_ID). Reader access is enough.
@@ -886,7 +947,7 @@ def load_sources(
     if config_path.is_file():
         try:
             config = load_config(config_path)
-        except (tomllib.TOMLDecodeError, ValueError) as exc:
+        except (tomllib.TOMLDecodeError, ValueError, TypeError) as exc:
             parser.error(str(exc))
     elif explicit:
         parser.error(f"config file not found: {config_path}")
@@ -946,7 +1007,11 @@ def parse_args(argv: list[str] | None = None) -> Settings:
 def main(argv: list[str] | None = None) -> int:
     """Entry point."""
     settings = parse_args(argv)
-    rows = collect(settings)
+    try:
+        rows = collect(settings)
+    except LookupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
     if not rows:
         print("No Linux VMs found", file=sys.stderr)
         return EXIT_ISSUES

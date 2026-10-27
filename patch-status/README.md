@@ -13,7 +13,7 @@ Each VM gets a `status` of **OK** or **Attention**, and an `issues` column that 
 | Power state | The VM isn't running (a deallocated VM can't be assessed or patched) |
 | Patch orchestration | `patchMode` isn't `AutomaticByPlatform`, or `bypassPlatformSafetyChecksOnUserSchedule` isn't set (without both, a maintenance schedule doesn't apply) |
 | Periodic assessment | `assessmentMode` isn't `AutomaticByPlatform` |
-| Schedule | No maintenance configuration assigned, it isn't weekly, or it isn't the one named with `--schedule` |
+| Schedule | No in-guest patch (`InGuestPatch`) maintenance configuration assigned, it isn't weekly, or it isn't the one named with `--schedule` |
 | Assessment | Older than `--stale-days` on a running VM, never run, or failed |
 | Patch run | Last run older than `--max-run-age`, none in the last 30 days, failed, completed with warnings, or some patches failed to install |
 | Pending work | A reboot is pending, or security or critical patches are waiting |
@@ -136,7 +136,7 @@ uv run patch_status.py --schedule mc-linux-weekly --fail-on-issues
 |---|---|
 | `0` | Report written. VMs may still need attention unless `--fail-on-issues` is set. |
 | `1` | No Linux VMs found, or `--fail-on-issues` is set and at least one VM needs attention. |
-| `2` | Bad arguments or config file. |
+| `2` | Bad arguments or config file, or a subscription or resource group that doesn't exist or the identity can't read. To scan a whole subscription the identity needs Reader on the subscription itself; with Reader on only some resource groups, list them with `-g` or `resource_groups`. |
 
 ## The report
 

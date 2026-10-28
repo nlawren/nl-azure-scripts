@@ -1,11 +1,13 @@
 [project]
 name = "patch-status"
 version = "0.1.0"
-description = "Report Azure Update Manager patch status for Linux VMs in a resource group"
+description = "Report Azure Update Manager patch status for Linux VMs across Azure subscriptions"
 requires-python = ">=3.14"
 dependencies = [
     "azure-identity",
     "azure-mgmt-resourcegraph",
+    "rich",
+    "rich-argparse",
     "xlsxwriter",
 ]
 

@@ -24,6 +24,9 @@ All data comes from Azure Resource Graph, one query per table, merged by VM ID:
     maintenanceresources        maintenance configuration assignments (the schedule)
     resources                   maintenance configurations (recurrence, start time, time zone)
 
+Progress and a summary go to stderr (timestamped lines, progress bar and tables via rich);
+colour and the progress bar switch off when stderr isn't a terminal.
+
 OS support status comes from the endoflife.date API (https://endoflife.date), looked up
 once per distro per run. If it can't be reached the column says so and nothing is flagged;
 --no-eol-check skips the lookup entirely.
@@ -38,21 +41,27 @@ the maintenance configurations live if that is elsewhere, so their schedules can
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
+import logging
 import os
 import re
 import sys
+import time
 import tomllib
 import urllib.request
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.error import URLError
 from zoneinfo import ZoneInfo
 
 import xlsxwriter
+from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
 from azure.mgmt.resourcegraph.models import (
@@ -61,8 +70,25 @@ from azure.mgmt.resourcegraph.models import (
     ResultFormat,
     ResultTruncated,
 )
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+from rich_argparse import RawDescriptionRichHelpFormatter
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator
 
 LOCAL_TZ = ZoneInfo("Australia/Sydney")
+ARM_SCOPE = "https://management.azure.com/.default"
 PAGE_SIZE = 1000  # Resource Graph maximum rows per page
 RG_NAME_RE = re.compile(r"^[\w.()-]{1,90}$")
 GUID_RE = re.compile(r"^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$", re.IGNORECASE)
@@ -127,6 +153,97 @@ COLUMNS = [
     "resourceId",
 ]
 DATE_COLUMNS = {"lastAssessment", "lastPatchRun"}
+
+# --- Console output ----------------------------------------------------------------------
+# Everything goes to stderr. Colour and live progress switch themselves off when stderr isn't
+# a terminal (a pipeline log); there a fixed width stops rich wrapping tables at 80 columns.
+# Timestamps in the normal text colour: rich's dim cyan is near-unreadable on dark themes.
+PIPELINE_WIDTH = 160
+MAX_ATTENTION_ROWS = 25  # VMs listed in the console; the report has them all
+TOP_ISSUES = 10
+CONSOLE = Console(
+    stderr=True,
+    log_path=False,
+    log_time_format="%H:%M:%S",
+    theme=Theme({"log.time": "default"}),
+    width=None if sys.stderr.isatty() else PIPELINE_WIDTH,
+)
+PROGRESS = Progress(
+    SpinnerColumn(),
+    TextColumn("{task.description}"),
+    BarColumn(),
+    MofNCompleteColumn(),
+    TimeElapsedColumn(),
+    console=CONSOLE,
+    transient=True,  # the log lines record what happened; don't leave a finished bar behind
+    disable=not CONSOLE.is_terminal,  # otherwise it prints a blank frame into pipeline logs
+)
+# DefaultAzureCredential logs a warning per credential it tries; sign_in() reports failure.
+logging.getLogger("azure.identity").setLevel(logging.ERROR)
+# Numbers and dates in an issue, so "assessment 5 days old" and "... 9 days old" count together.
+ISSUE_DETAIL_RE = re.compile(r"\d[\d-]*")
+
+
+def log(msg: str, style: str | None = None) -> None:
+    """Print a timestamped progress line; markup off so VM names can't break it."""
+    if CONSOLE.is_terminal:
+        CONSOLE.log(msg, style=style, markup=False)
+    else:
+        # Plain lines when piped: rich would pad them to the console width.
+        print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    """Log a warning in yellow."""
+    log(f"Warning: {msg}", style="yellow")
+
+
+def plural(count: int, noun: str) -> str:
+    """Return e.g. '1 Linux VM' or '3 Linux VMs'."""
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def fail(msg: str, code: int = EXIT_ISSUES) -> NoReturn:
+    """Log an error in red and exit."""
+    log(f"Error: {msg}", style="bold red")
+    sys.exit(code)
+
+
+@contextmanager
+def running() -> Generator[None]:
+    """Show live progress for the scan and report Azure failures cleanly."""
+    with PROGRESS:
+        try:
+            yield
+        except LookupError as exc:
+            fail(str(exc), EXIT_CONFIG)
+        except HttpResponseError as exc:
+            fail(f"Resource Graph returned {exc.status_code}: {exc.message}")
+        except RuntimeError as exc:
+            fail(str(exc))
+
+
+def token_identity(token: str) -> str:
+    """Return the account and tenant a JWT was issued for, for display only."""
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    account = claims.get("upn") or claims.get("unique_name") or claims.get("appid", "unknown")
+    return f"{account} (tenant {claims.get('tid', 'unknown')})"
+
+
+def sign_in() -> DefaultAzureCredential:
+    """Get a credential and check it works now, rather than on the first query."""
+    credential = DefaultAzureCredential()
+    try:
+        token = credential.get_token(ARM_SCOPE).token
+    except ClientAuthenticationError as exc:
+        fail(
+            "Azure sign-in failed. Run `az login`, or set AZURE_TENANT_ID, AZURE_CLIENT_ID and "
+            f"AZURE_CLIENT_SECRET: {str(exc).splitlines()[0]}"
+        )
+    log(f"Authenticated as {token_identity(token)}", style="green")
+    return credential
+
 
 # --- Resource Graph queries --------------------------------------------------------------
 # {rg_filter} is empty (whole subscription) or a resource group filter built by rg_filter()
@@ -313,9 +430,7 @@ class EolLookup:
                 with urllib.request.urlopen(request, timeout=EOL_TIMEOUT) as resp:  # noqa: S310
                     self._cache[product] = json.load(resp)["result"]["releases"]
             except (URLError, TimeoutError, ValueError, KeyError) as exc:
-                print(
-                    f"warning: endoflife.date lookup for {product} failed: {exc}", file=sys.stderr
-                )
+                warn(f"endoflife.date lookup for {product} failed: {exc}")
                 self._cache[product] = None
         return self._cache[product]
 
@@ -485,26 +600,39 @@ def find_issues(
 
 def collect(settings: Settings) -> list[dict[str, Any]]:
     """Query Resource Graph and build one merged report row per Linux VM, for every target."""
-    client = ResourceGraphClient(DefaultAzureCredential())
+    client = ResourceGraphClient(sign_in())
     sub_ids = [t.id for t in settings.targets]
+    step = PROGRESS.add_task("Checking access", total=None)
     containers = run_query(client, sub_ids, CONTAINER_QUERY)
     sub_names = {r["subscriptionId"]: r["name"] for r in containers if r["isSubscription"]}
     check_readable(settings.targets, sub_names, containers)
+    PROGRESS.update(step, description="Reading maintenance configurations")
     configs = {r["configId"]: r for r in run_query(client, None, CONFIG_QUERY)}
+    PROGRESS.remove_task(step)
+    log(f"Found {plural(len(configs), 'maintenance configuration')} the identity can read")
     eol = EolLookup(settings.eol_warn_days) if settings.eol_check else None
     now = datetime.now(UTC)
 
     rows: list[dict[str, Any]] = []
+    task = PROGRESS.add_task("Scanning", total=len(settings.targets))
     for target in settings.targets:
         label = target.name or sub_names.get(target.id) or target.id
+
+        def show(stage: str, label: str = label) -> None:
+            PROGRESS.update(task, description=f"{label}: {stage}")
+
         found = collect_target(
-            client, target, label, configs=configs, eol=eol, settings=settings, now=now
+            client, target, label, configs=configs, eol=eol, settings=settings, now=now, show=show
         )
-        print(
-            f"{label} ({target.scope}): {len(found)} Linux VM{'' if len(found) == 1 else 's'}",
-            file=sys.stderr,
+        attention = sum(r["status"] == "Attention" for r in found)
+        log(
+            f"{label} ({target.scope}): {plural(len(found), 'Linux VM')}, "
+            f"{attention} need{'s' if attention == 1 else ''} attention",
+            style="yellow" if attention else None,
         )
         rows.extend(found)
+        PROGRESS.advance(task)
+    PROGRESS.remove_task(task)
     rows.sort(key=lambda r: (r["subscription"].lower(), r["resourceGroup"], r["name"].lower()))
     return rows
 
@@ -542,24 +670,30 @@ def collect_target(  # noqa: PLR0913 - plumbing for one subscription
     eol: EolLookup | None,
     settings: Settings,
     now: datetime,
+    show: Callable[[str], None],
 ) -> list[dict[str, Any]]:
-    """Build report rows for the Linux VMs in one subscription (or its resource groups)."""
+    """Build report rows for the Linux VMs in one subscription (or its resource groups).
+
+    `show` is told each stage as it starts, for the progress display.
+    """
     flt = rg_filter(target.resource_groups)
 
-    def query(template: str) -> list[dict[str, Any]]:
+    def query(stage: str, template: str) -> list[dict[str, Any]]:
+        show(stage)
         return run_query(client, [target.id], template.format(rg_filter=flt))
 
-    vms = query(VM_QUERY)
+    vms = query("VMs", VM_QUERY)
     if not vms:
         return []
-    assessments = {r["vmId"]: r for r in query(ASSESSMENT_QUERY)}
-    installations = {r["vmId"]: r for r in query(INSTALLATION_QUERY)}
+    assessments = {r["vmId"]: r for r in query("assessments", ASSESSMENT_QUERY)}
+    installations = {r["vmId"]: r for r in query("patch runs", INSTALLATION_QUERY)}
     assigned: dict[str, list[dict[str, Any]]] = {}
-    for a in query(ASSIGNMENT_QUERY):
+    for a in query("schedules", ASSIGNMENT_QUERY):
         # A config the identity can't read won't be in `configs`; fall back to its name.
         config = configs.get(a["configId"]) or {"configName": a["configId"].rsplit("/", 1)[-1]}
         assigned.setdefault(a["vmId"], []).append(config)
 
+    show("OS support" if eol else "checks")
     rows: list[dict[str, Any]] = []
     for vm in vms:
         vm_id = vm["vmId"]
@@ -616,7 +750,8 @@ def to_local(value: datetime | None) -> datetime | None:
 
 def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
     """Write the report as CSV with local timestamps."""
-    with path.open("w", newline="", encoding="utf-8") as fh:
+    # BOM so Excel reads the file as UTF-8 and doesn't garble non-ASCII names.
+    with path.open("w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=COLUMNS)
         writer.writeheader()
         for row in rows:
@@ -717,22 +852,63 @@ def write_xlsx(rows: list[dict[str, Any]], path: Path, settings: Settings) -> No
         about.set_column(2, 3, 30)
 
 
-def print_summary(rows: list[dict[str, Any]]) -> None:
-    """Print a short console summary of VMs that need attention."""
+def print_summary(rows: list[dict[str, Any]], settings: Settings, started: float) -> None:
+    """Print end-of-run tables: totals, each subscription, common issues and flagged VMs."""
     attention = [r for r in rows if r["status"] == "Attention"]
-    print(
-        f"{len(rows)} Linux VM{'' if len(rows) == 1 else 's'}, "
-        f"{len(rows) - len(attention)} OK, {len(attention)} need attention"
+    totals = Table(title="Summary", title_justify="left", show_header=False)
+    totals.add_column(style="bold")
+    totals.add_column(justify="right")
+    totals.add_row("Linux VMs", str(len(rows)))
+    totals.add_row("OK", str(len(rows) - len(attention)), style="green")
+    totals.add_row("Need attention", str(len(attention)), style="red" if attention else None)
+    totals.add_row("Time taken", f"{time.monotonic() - started:.1f}s")
+    CONSOLE.print(totals)
+
+    if len(settings.targets) > 1:
+        subs = Table(title="By subscription", title_justify="left")
+        subs.add_column("Subscription")
+        subs.add_column("Scope")
+        for col in ("VMs", "OK", "Attention"):
+            subs.add_column(col, justify="right")
+        for target in settings.targets:
+            mine = [r for r in rows if r["resourceId"].startswith(f"/subscriptions/{target.id}/")]
+            flagged = sum(r["status"] == "Attention" for r in mine)
+            subs.add_row(
+                Text(mine[0]["subscription"] if mine else (target.name or target.id)),
+                Text(target.scope),
+                str(len(mine)),
+                Text(str(len(mine) - flagged), style="green"),
+                Text(str(flagged), style="red" if flagged else ""),
+            )
+        CONSOLE.print(subs)
+
+    if not attention:
+        return
+    counts = Counter(
+        ISSUE_DETAIL_RE.sub("…", issue).removeprefix("… ")
+        for r in attention
+        for issue in r["issues"].split("; ")
     )
-    if attention:
-        width = max(len(r["name"]) for r in attention)
-        current = None
-        for r in attention:
-            if r["subscription"] != current:
-                current = r["subscription"]
-                print(f"\n{current}")
-            print(f"  {r['name']:<{width}}  {r['issues']}  [{r['resourceGroup']}]")
-        print()
+    issues = Table(title="Most common issues", title_justify="left")
+    issues.add_column("Issue")
+    issues.add_column("VMs", justify="right")
+    for issue, count in counts.most_common(TOP_ISSUES):
+        issues.add_row(Text(issue), str(count))
+    if len(counts) > TOP_ISSUES:
+        issues.caption = f"{len(counts) - TOP_ISSUES} more kinds of issue in the report"
+    CONSOLE.print(issues)
+
+    # Worst first, so a cut-off list still shows what matters most.
+    worst = sorted(attention, key=lambda r: -len(r["issues"].split("; ")))
+    flagged = Table(title="Need attention (most issues first)", title_justify="left")
+    for col in ("VM", "Subscription", "Resource group"):
+        flagged.add_column(col, no_wrap=True)
+    flagged.add_column("Issues", style="yellow")
+    for r in worst[:MAX_ATTENTION_ROWS]:
+        flagged.add_row(*(Text(r[c]) for c in ("name", "subscription", "resourceGroup", "issues")))
+    if len(attention) > MAX_ATTENTION_ROWS:
+        flagged.caption = f"{len(attention) - MAX_ATTENTION_ROWS} more in the report"
+    CONSOLE.print(flagged)
 
 
 def load_env_file(path: Path) -> None:
@@ -751,7 +927,11 @@ def load_env_file(path: Path) -> None:
 def load_config(path: Path) -> dict[str, Any]:
     """Read the TOML config, rejecting unknown keys so typos don't pass silently."""
     with path.open("rb") as fh:
-        config = tomllib.load(fh)
+        try:
+            config = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            msg = f"{path}: {exc}"
+            raise ValueError(msg) from exc
     unknown = set(config) - set(DEFAULTS) - {"subscriptions"}
     if unknown:
         msg = f"{path}: unknown setting(s): {', '.join(sorted(unknown))}"
@@ -840,7 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="patch_status.py",
         description=HELP_DESCRIPTION,
         epilog=HELP_EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=RawDescriptionRichHelpFormatter,
     )
 
     scope = parser.add_argument_group("what to scan")
@@ -947,7 +1127,7 @@ def load_sources(
     if config_path.is_file():
         try:
             config = load_config(config_path)
-        except (tomllib.TOMLDecodeError, ValueError, TypeError) as exc:
+        except (ValueError, TypeError) as exc:
             parser.error(str(exc))
     elif explicit:
         parser.error(f"config file not found: {config_path}")
@@ -1007,20 +1187,22 @@ def parse_args(argv: list[str] | None = None) -> Settings:
 def main(argv: list[str] | None = None) -> int:
     """Entry point."""
     settings = parse_args(argv)
-    try:
+    started = time.monotonic()
+    log(
+        f"Started: scanning {plural(len(settings.targets), 'subscription')} "
+        f"(from {settings.config_source})"
+    )
+    with running():
         rows = collect(settings)
-    except LookupError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_CONFIG
     if not rows:
-        print("No Linux VMs found", file=sys.stderr)
+        warn("no Linux VMs found")
         return EXIT_ISSUES
     if settings.output_format == "csv":
         write_csv(rows, settings.output)
     else:
         write_xlsx(rows, settings.output, settings)
-    print_summary(rows)
-    print(f"Report written to {settings.output}")
+    log(f"Wrote {plural(len(rows), 'Linux VM')} to {settings.output}", style="green")
+    print_summary(rows, settings, started)
     attention = any(r["status"] == "Attention" for r in rows)
     return EXIT_ISSUES if attention and settings.fail_on_issues else 0
 

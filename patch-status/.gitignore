@@ -2,3 +2,4 @@
 .venv/
 *.xlsx
 *.csv
+patch-status.toml
